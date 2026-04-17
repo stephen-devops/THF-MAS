@@ -85,36 +85,6 @@ Available tools cover:
 
 Always provide context about what the data means from a security perspective.
 
-**CRITICAL: Anomaly Detection Response Requirements**
-When presenting anomaly detection results, you MUST explicitly state threshold sources and RCF baseline information:
-
-**1. Threshold Source Identification (REQUIRED IN EVERY RESPONSE):**
-- If using RCF-learned thresholds: State "Using RCF-learned thresholds from [X-day] baseline (confidence: [Y]%)"
-- If using fallback thresholds: State "Using static fallback threshold of [value] (no RCF baseline data available)"
-- ALWAYS specify the baseline period (e.g., "7-day RCF baseline", "30-day behavioral baseline")
-
-**2. Three Threshold Types - Define When Mentioned:**
-- **User-Provided Threshold**: Numeric value from query (e.g., "threshold: 150") - fallback only when RCF unavailable
-- **RCF Feature Thresholds**: Internal OpenSearch plugin thresholds for each RCF feature (alert_count_threshold: 65.7, severity_sum_threshold: 297.4, etc.)
-- **RCF-Learned Thresholds**: Dynamic thresholds from baseline analysis - OVERRIDE user-provided values when available
-
-**3. Format Requirements for Anomaly Responses:**
-- Start with: "Based on [RCF-learned/static fallback] baseline analysis over the last [X] days..."
-- Include: Baseline confidence score (if RCF: "96.44% confidence")
-- Specify: Which thresholds were exceeded (e.g., "Alert count: 6,669 (exceeds RCF threshold 65.7 by 6,603)")
-- For each anomaly: Clearly state "X exceeds RCF-learned threshold Y" or "X exceeds static threshold Y"
-
-**4. Detection Type-Specific Terminology:**
-- **Threshold Detection**: "RCF-learned threshold breach" / "sudden burst exceeding baseline"
-- **Trend Detection**: "Progressive escalation above RCF trend baseline" / "directional shift from baseline pattern"
-- **Behavioral Detection**: "Behavioral deviation from RCF entity baseline" / "anomalous pattern compared to normal behavior"
-
-**5. Example Good Response Opening:**
-"Based on RCF-learned baseline analysis over the last 3 days with 96.44% confidence, I've identified 25 critical threshold breaches. The RCF-learned alert count threshold is 65.7 (baseline mean: 21.25), which was exceeded by the following hosts..."
-
-**6. Example Bad Response (AVOID):**
-"I found anomalies exceeding thresholds..." (Missing: which threshold type? What baseline? What confidence?)
-
 Technical note: When context hints from previous input query like "these alerts", "this host", "this command, these processes", etc appear, consider using previous input parameters to maintain query continuity."""
 
         # Initialize callbacks
