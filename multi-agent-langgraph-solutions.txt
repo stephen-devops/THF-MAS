@@ -1,0 +1,212 @@
+================================================================================
+LANGGRAPH AS A SOLUTION FOR THF MULTI-AGENT ARCHITECTURE
+================================================================================
+Date: 2026-04-15
+Scope: Evaluating LangGraph's state management and context persistence for the
+       Wazuh Security Agent's multi-step adaptive reasoning and context preservation
+
+================================================================================
+1. WHAT LANGGRAPH SOLVES
+================================================================================
+
+1.1 CONTEXT SHARING ACROSS AGENTS (THE BIGGEST WIN)
+--------------------------------------------------------------------------------
+
+The current ConversationContextProcessor + _merge_context_filters() system
+(agent/context_processor.py and tools/wazuh_tools.py:33-120) is a hand-rolled
+context bridge. LangGraph replaces this with a typed state object that flows
+through the entire graph:
+
+    class THFState(TypedDict):
+        messages: Annotated[list, add_messages]
+        previous_host: str
+        previous_time_range: str
+        previous_rule_ids: list[str]
+        suggested_filters: dict
+        tool_results: dict  # accumulated results from all subagent calls
+
+Every node (supervisor, subagents) reads from and writes to this shared state.
+The _merge_context_filters() at tools/wazuh_tools.py:33-120 becomes unnecessary
+-- the subagent reads state["previous_host"] directly rather than fishing it out
+of a serialized context result.
+
+Additionally, LangGraph's ToolRuntime gives subagents explicit access to the
+supervisor's state:
+
+    def call_anomaly_detector(query: str, runtime: ToolRuntime[None, THFState]):
+        # Subagent can read previous context from supervisor state
+        context = runtime.state["suggested_filters"]
+        result = anomaly_subagent.invoke({"messages": [...], "context": context})
+        return result
+
+This means subagents are not truly stateless -- they receive the graph's
+accumulated state at invocation time, which solves the context loss problem
+(Drawback 4.3 from multi-agent-support.txt).
+
+
+1.2 CHECKPOINTING REPLACES RETRY/MEMORY CORRUPTION LOGIC
+--------------------------------------------------------------------------------
+
+The current _execute_with_retry at wazuh_agent.py:364-426 handles API overload
+and memory corruption manually. LangGraph's checkpointing persists state at
+every graph transition. If the anomaly subagent fails at step 3 of a 5-step
+investigation, you resume from step 3 rather than re-running the entire chain.
+
+This also replaces the fragile ConversationSummaryBufferMemory (1500 token
+limit, session_memory.clear() on corruption) with durable, persistent state.
+
+Key benefits:
+  - Time-travel debugging: rewind to any step and re-run with modified params
+  - Human-in-the-loop: pause the graph, wait for analyst approval, resume
+  - Failure recovery: resume from last checkpoint instead of full restart
+  - Production persistence: PostgreSQL checkpointers for high-throughput use
+
+
+1.3 NATIVE ASYNC PARALLEL EXECUTION
+--------------------------------------------------------------------------------
+
+The proposed parallel subagent invocation becomes trivial. LangGraph's Send API
+dispatches multiple subagents concurrently:
+
+    # Supervisor node decides to invoke two tools in parallel
+    def route_query(state: THFState):
+        return [
+            Send("anomaly_detector", {**state, "query": "check anomalies"}),
+            Send("alert_analyzer", {**state, "query": "analyze alerts"}),
+        ]
+
+This replaces the need to manually wire up asyncio.gather around separate
+AgentExecutor instances.
+
+
+================================================================================
+2. WHAT LANGGRAPH DOES NOT SOLVE
+================================================================================
+
+2.1 ADAPTIVE MID-CHAIN REASONING (DRAWBACK 4.2 -- MOST CRITICAL)
+--------------------------------------------------------------------------------
+
+The example in example_multi-request_workflow.txt shows:
+
+    map_relationships("OneDrive.exe")                          -> 0 results
+      -> LLM reasons: "let me try the full path"
+    map_relationships("C:\Users\...\OneDrive.exe")             -> 0 results
+      -> LLM reasons: "let me pivot to analyze_alerts instead"
+    analyze_alerts(rule.id=92910)                              -> 18 results
+
+This adaptive behavior happens inside the LLM's reasoning loop within a single
+AgentExecutor session. The LLM sees the intermediate Observation and decides
+what to do next. LangGraph gives two ways to replicate this:
+
+OPTION A: Keep the reasoning loop inside the supervisor node.
+  The supervisor itself is still an LLM agent with tools. It calls subagents as
+  tools, sees their results, and decides what to do next -- exactly like the
+  current AgentExecutor but with typed state. This preserves adaptive reasoning
+  but the supervisor still needs enough tool knowledge to adapt.
+
+OPTION B: Build adaptation into the graph edges.
+  Define conditional edges that route based on tool results:
+
+    def should_retry_or_pivot(state: THFState):
+        last_result = state["tool_results"][-1]
+        if last_result.get("total_connections") == 0:
+            return "retry_with_context"  # edge back to same subagent
+        return "synthesize"              # edge to final response
+
+  Option B makes the adaptation explicit in code rather than relying on the LLM
+  to reason about it. This is more predictable but less flexible -- you'd need
+  to anticipate failure patterns upfront.
+
+
+2.2 LATENCY (DRAWBACK 4.1 -- UNCHANGED)
+--------------------------------------------------------------------------------
+
+LangGraph does not reduce LLM round-trips. Supervisor -> subagent -> supervisor
+still costs the same number of API calls. The parallel execution helps for
+independent tool calls but sequential chains are still additive.
+
+
+================================================================================
+3. RECOMMENDED MIGRATION PATH FOR THF
+================================================================================
+
+The highest-value approach does NOT require going full multi-agent. Instead:
+
+STEP 1: Replace AgentExecutor with a LangGraph graph
+  Keep it as a single-agent tool-calling loop but with typed state instead of
+  ConversationSummaryBufferMemory.
+
+STEP 2: Add checkpointing
+  Replaces the manual retry logic (_execute_with_retry) and memory corruption
+  handling (session_memory.clear()).
+
+STEP 3: Replace ConversationContextProcessor with graph state
+  Context filters become first-class state fields rather than regex-extracted
+  hints. The _detect_contextual_reference() and _extract_previous_context()
+  methods in context_processor.py become state reducers.
+
+STEP 4: Keep the adaptive reasoning intact
+  The LLM still has all 8 tools and reasons within the loop. The Thought ->
+  Action -> Observation pattern continues to work, just backed by typed state.
+
+STEP 5 (FUTURE): Add supervisor/subagent splitting as tool count grows
+  Use the same graph infrastructure. The graph nodes that are currently tool
+  calls become subagent invocations. The typed state schema carries over.
+
+This gives LangGraph's state management and persistence benefits without
+sacrificing the multi-step adaptive reasoning that makes the agent effective.
+
+
+================================================================================
+4. SUMMARY: LANGGRAPH VS CURRENT ARCHITECTURE
+================================================================================
+
+  Component                     | Current (AgentExecutor)         | LangGraph
+  ------------------------------|--------------------------------|---------------------------
+  State management              | ConversationSummaryBufferMemory| Typed state (TypedDict)
+  Context preservation          | ConversationContextProcessor   | Graph state fields
+  Context merging in tools      | _merge_context_filters()       | ToolRuntime state access
+  Failure recovery              | _execute_with_retry (manual)   | Checkpointing (automatic)
+  Memory corruption handling    | session_memory.clear()         | Persistent checkpoints
+  Parallel tool execution       | Not supported                  | Native Send API
+  Adaptive reasoning            | AgentExecutor loop (works)     | Supervisor loop (same)
+  Debugging                     | verbose=True + LangSmith       | Time-travel + LangSmith
+  Latency per tool call         | 1 LLM round-trip               | 1 LLM round-trip (same)
+  Multi-agent readiness         | Requires full refactor         | Add nodes to existing graph
+
+
+================================================================================
+5. KEY INSIGHT
+================================================================================
+
+LangGraph is a better execution framework for what THF already has, not just an
+enabler for multi-agent. The migration to LangGraph should be treated as an
+infrastructure upgrade to the single-agent architecture first, with multi-agent
+splitting as an optional future step when tool count exceeds 12-15.
+
+
+================================================================================
+SOURCES
+================================================================================
+
+- LangChain Docs -- Subagents:
+  https://docs.langchain.com/oss/python/langchain/multi-agent/subagents
+
+- LangGraph Supervisor Reference:
+  https://reference.langchain.com/python/langgraph-supervisor
+
+- LangChain Docs -- Workflows & Agents:
+  https://docs.langchain.com/oss/python/langgraph/workflows-agents
+
+- MarkTechPost -- Production-Grade Multi-Agent System (Mar 2026):
+  https://www.marktechpost.com/2026/03/01/how-to-design-a-production-grade-multi-agent-communication-system-using-langgraph-structured-message-bus-acp-logging-and-persistent-shared-state-architecture/
+
+- Best Multi-Agent Frameworks 2026:
+  https://gurusup.com/blog/best-multi-agent-frameworks-2026
+
+- LangGraph in 2026 -- DEV Community:
+  https://dev.to/ottoaria/langgraph-in-2026-build-multi-agent-ai-systems-that-actually-work-3h5
+
+================================================================================
+END OF ANALYSIS
+================================================================================

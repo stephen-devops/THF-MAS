@@ -1,0 +1,99 @@
+services:
+  # ==============================================================================
+  # THF (Threat Hunting Framework) - Main Application
+  # ==============================================================================
+  resilmesh-tap-thf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: thf:latest
+    container_name: resilmesh-tap-thf
+
+    # Port mappings
+    ports:
+      - "8030:8000"   # FastAPI backend
+      - "8501:8501"   # Streamlit UI
+
+    # Environment variables from .env file
+    env_file:
+      - .env
+
+    # Alternative: Specify environment variables directly
+    # environment:
+    #   - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    #   - OPENSEARCH_HOST=${OPENSEARCH_HOST}
+    #   - OPENSEARCH_PORT=${OPENSEARCH_PORT}
+    #   - OPENSEARCH_USER=${OPENSEARCH_USER}
+    #   - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}
+
+    # Volume mounts (optional - for persistent logs)
+    volumes:
+      - ./logs:/app/logs
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Resource limits (optional - adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+    # Networks
+    networks:
+      - resilmesh_network
+
+  # ==============================================================================
+  # Redis (OPTIONAL) - Uncomment to enable caching
+  # ==============================================================================
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: thf-redis
+  #
+  #   ports:
+  #     - "6379:6379"
+  #
+  #   # Optional: Persist Redis data
+  #   volumes:
+  #     - redis-data:/data
+  #
+  #   # Restart policy
+  #   restart: unless-stopped
+  #
+  #   # Health check
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #
+  #   networks:
+  #     - thf-network
+
+# ==============================================================================
+# Networks
+# ==============================================================================
+
+# ==============================================================================
+# Volumes (OPTIONAL)
+# ==============================================================================
+volumes:
+  # Uncomment if using Redis
+  # redis-data:
+  #   driver: local
+
+  # Application logs (created automatically when mounted)
+  logs:
+    driver: local
