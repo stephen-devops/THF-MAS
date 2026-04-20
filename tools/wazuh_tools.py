@@ -290,7 +290,7 @@ class InvestigateEntityTool(WazuhBaseTool):
 class MapRelationshipsTool(WazuhBaseTool):
     """Tool for mapping relationships between entities"""
     name: str = "map_relationships"
-    description: str = """Map directional relationships between entities (users, hosts, files, processes). Identifies who/what spawned, created, modified, accessed, injected into, or logged into what.
+    description: str = """Map directional relationships between entities (users, hosts, files, processes). Identifies who/what spawned, created, modified, accessed, deleted, injected into, or logged into what.
 
 DIRECTION: Subject performing action = source; object receiving action = target. 'What did X do to Y?' → source=X, target=Y.
 
