@@ -16,6 +16,7 @@ from collections import defaultdict
 from functions._shared.opensearch_client import WazuhOpenSearchClient
 from tools.wazuh_tools import get_all_tools
 from .context_processor import ConversationContextProcessor
+from .tool_selector import ToolSelector
 
 logger = structlog.get_logger()
 
@@ -59,7 +60,10 @@ class WazuhSecurityAgent:
 
         # Initialize context processor
         self.context_processor = ConversationContextProcessor()
-        
+
+        # Initialize tool selector (uses fast Haiku model)
+        self.tool_selector = ToolSelector(anthropic_api_key)
+
         # Enhanced system prompt with context preservation instructions
         self.system_prompt = """You are a Wazuh SIEM security analyst assistant. You help users investigate security incidents, analyze alerts, and understand their security posture.
 
@@ -87,18 +91,46 @@ Always provide context about what the data means from a security perspective.
 
 Technical note: When context hints from previous input query like "these alerts", "this host", "this command, these processes", etc appear, consider using previous input parameters to maintain query continuity."""
 
-        # Initialize callbacks
-        callbacks = []
-        # Only enable LangSmith tracing if properly configured
-        try:
-            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
-                callbacks.append(LangChainTracer())
-                logger.info("LangSmith tracing enabled")
-        except Exception as e:
-            logger.warning("Failed to initialize LangSmith tracing", error=str(e))
+        # Agent executor is built per-query with selected tools via _build_query_agent()
+        self.agent = None
 
-        # Create prompt template for structured chat agent
-        # The system prompt needs to include tool information
+        logger.info("Wazuh Security Agent initialized",
+                   tools_count=len(self.tools),
+                   model="claude-4-sonnet")
+
+    def _create_session_memory(self):
+        """Create a new memory instance for a session"""
+        # Use ConversationSummaryBufferMemory for better context management
+        return ConversationSummaryBufferMemory(
+            llm=self.llm,
+            max_token_limit=1500,  # Reduced to prevent API overload
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="output"
+        )
+
+    def _get_session_memory(self, session_id: str):
+        """Get or create memory for a specific session"""
+        if session_id not in self.session_memories:
+            logger.info("Creating new session memory", session_id=session_id)
+        return self.session_memories[session_id]
+
+    def _build_query_agent(self, selected_tool_names: List[str], session_memory):
+        """
+        Build a per-query AgentExecutor with only the selected tools.
+
+        Args:
+            selected_tool_names: Tool names selected by the tool selector
+            session_memory: Session-specific memory instance
+        """
+        # Filter tools to only selected ones
+        query_tools = [t for t in self.tools if t.name in selected_tool_names]
+
+        # Fallback: if filtering produced nothing, use all tools
+        if not query_tools:
+            query_tools = self.tools
+
+        # Build prompt
         system_message = f"""{self.system_prompt}
 
 You have access to the following tools:
@@ -143,124 +175,33 @@ Action:
             ("human", "{input}\n\n{agent_scratchpad}"),
         ])
 
-        # Create the structured chat agent
         agent = create_structured_chat_agent(
             llm=self.llm,
-            tools=self.tools,
+            tools=query_tools,
             prompt=prompt
         )
 
-        # Create agent executor
+        # Initialize callbacks
+        callbacks = []
+        try:
+            if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
+                callbacks.append(LangChainTracer())
+        except Exception:
+            pass
+
         self.agent = AgentExecutor(
             agent=agent,
-            tools=self.tools,
-            memory=self.memory,
+            tools=query_tools,
+            memory=session_memory,
             verbose=True,
             callbacks=callbacks,
             handle_parsing_errors=True,
-            max_iterations=15  # Allow more iterations for complex threat hunting queries
-        )
-        
-        logger.info("Wazuh Security Agent initialized",
-                   tools_count=len(self.tools),
-                   model="claude-4-sonnet")
-
-    def _create_session_memory(self):
-        """Create a new memory instance for a session"""
-        # Use ConversationSummaryBufferMemory for better context management
-        return ConversationSummaryBufferMemory(
-            llm=self.llm,
-            max_token_limit=1500,  # Reduced to prevent API overload
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="output"
+            max_iterations=15
         )
 
-    def _get_session_memory(self, session_id: str):
-        """Get or create memory for a specific session"""
-        if session_id not in self.session_memories:
-            logger.info("Creating new session memory", session_id=session_id)
-        return self.session_memories[session_id]
-
-    def _update_agent_memory(self, session_id: str):
-        """Update the agent's memory to use the session-specific memory"""
-        if self.current_session_id != session_id:
-            self.current_session_id = session_id
-            session_memory = self._get_session_memory(session_id)
-
-            # Re-initialize agent with session-specific memory
-            callbacks = []
-            try:
-                if os.getenv("LANGCHAIN_TRACING_V2") == "true" and os.getenv("LANGCHAIN_API_KEY"):
-                    callbacks.append(LangChainTracer())
-            except Exception as e:
-                logger.warning("Failed to initialize LangSmith tracing", error=str(e))
-
-            # Create prompt template for structured chat agent
-            # The system prompt needs to include tool information
-            system_message = f"""{self.system_prompt}
-
-You have access to the following tools:
-
-{{tools}}
-
-Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
-
-Valid "action" values: "Final Answer" or {{tool_names}}
-
-Provide only ONE action per $JSON_BLOB, as shown:
-
-```
-{{{{
-  "action": $TOOL_NAME,
-  "action_input": $INPUT
-}}}}
-```
-
-Follow this format:
-
-Question: input question to answer
-Thought: consider previous and subsequent steps
-Action:
-```
-$JSON_BLOB
-```
-Observation: action result
-... (repeat Thought/Action/Observation N times)
-Thought: I know what to respond
-Action:
-```
-{{{{
-  "action": "Final Answer",
-  "action_input": "Final response to human"
-}}}}
-```"""
-
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", system_message),
-                MessagesPlaceholder(variable_name="chat_history", optional=True),
-                ("human", "{input}\n\n{agent_scratchpad}"),
-            ])
-
-            # Create the structured chat agent
-            agent = create_structured_chat_agent(
-                llm=self.llm,
-                tools=self.tools,
-                prompt=prompt
-            )
-
-            # Create agent executor with session-specific memory
-            self.agent = AgentExecutor(
-                agent=agent,
-                tools=self.tools,
-                memory=session_memory,
-                verbose=True,
-                callbacks=callbacks,
-                handle_parsing_errors=True,
-                max_iterations=15  # Allow more iterations for complex threat hunting queries
-            )
-
-            logger.info("Agent memory updated for session", session_id=session_id)
+        logger.info("Built per-query agent",
+                   selected_tools=[t.name for t in query_tools],
+                   tool_count=len(query_tools))
 
     async def query(self, user_input: str, session_id: str = "default") -> str:
         """
@@ -274,33 +215,38 @@ Action:
             Agent's response
         """
         try:
-            # Update agent memory for this session
-            self._update_agent_memory(session_id)
+            # Get/create session memory
+            session_memory = self._get_session_memory(session_id)
+            self.current_session_id = session_id
 
             # Get conversation history for context analysis
-            session_memory = self._get_session_memory(session_id)
             chat_history = []
             try:
-                # Safely access chat history - memory operations can fail
                 if hasattr(session_memory, 'chat_memory'):
                     chat_history = session_memory.chat_memory.messages
             except Exception as mem_error:
                 logger.warning("Failed to load chat history, using empty history",
                              error=str(mem_error),
                              session_id=session_id)
-                # Reset corrupted memory
                 session_memory.clear()
                 chat_history = []
 
-            # Process context separately from LLM prompt
+            # Process context
             context_result = self.context_processor.process_query_with_context(user_input, chat_history)
+
+            # Select tools for this query using Haiku
+            selected_tool_names = await self.tool_selector.select_tools(user_input, context_result)
+
+            # Build per-query agent with only selected tools
+            self._build_query_agent(selected_tool_names, session_memory)
 
             logger.info("Processing agent query with session context",
                        query_preview=user_input[:100],
                        session_id=session_id,
                        history_length=len(chat_history),
                        context_applied=context_result["context_applied"],
-                       reasoning=context_result["reasoning"])
+                       reasoning=context_result["reasoning"],
+                       selected_tools=selected_tool_names)
 
             # Create enriched input with context for LLM when context is applied
             enriched_input = user_input
@@ -317,9 +263,10 @@ Action:
             # Execute agent with context-aware input
             response = await self._execute_with_retry(enriched_input, context_result)
 
-            logger.info("Agent query completed with context",
+            logger.info("Agent query completed",
                        query_preview=user_input[:100],
                        session_id=session_id,
+                       tools_used=selected_tool_names,
                        response_length=len(response))
 
             return response
