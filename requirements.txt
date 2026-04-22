@@ -1,8 +1,9 @@
 # Core LLM and Agent Framework
-# Pinned to 0.3.x versions
-langchain==0.3.27
-langchain-core==0.3.76
-langchain-anthropic==0.3.17
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-anthropic>=0.4.0
+langgraph>=0.4.1
+langgraph-checkpoint>=2.0.0
 langsmith>=0.4.5
 anthropic>=0.57.1
 
