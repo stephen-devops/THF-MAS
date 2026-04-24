@@ -2,6 +2,7 @@
 Wazuh LLM Assistant - Main FastAPI Application
 """
 import os
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,6 +12,13 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Set stdlib root logger to INFO so structlog's filter_by_level doesn't drop info messages
+logging.basicConfig(
+    format="%(message)s",
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    handlers=[logging.StreamHandler()],
+)
 
 # Configure structured logging
 structlog.configure(

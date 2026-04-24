@@ -167,11 +167,26 @@ class ContextMiddleware(AgentMiddleware):
     state_schema = THFState
 
     def before_model(self, state: THFState, runtime) -> dict[str, Any] | None:
-        """Extract structured context from previous tool results and inject hints."""
+        """Log Observations from previous tool step, then extract/inject context."""
         messages = state.get("messages", [])
         if not messages:
             return None
 
+        # --- Verbose logging: Observation (tool results from previous step) ---
+        # Log any ToolMessages that follow the last AIMessage (i.e. fresh results)
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage):
+                content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, default=str)
+                # Truncate long results for readability
+                preview = content[:1000] + "..." if len(content) > 1000 else content
+                logger.info("Observation",
+                            tool=msg.name if hasattr(msg, "name") else "unknown",
+                            result=preview)
+            elif isinstance(msg, AIMessage):
+                # Stop at the last AIMessage — only log observations since then
+                break
+
+        # --- Context extraction ---
         # Find the latest HumanMessage to check for contextual references
         latest_human = None
         for msg in reversed(messages):
@@ -179,7 +194,6 @@ class ContextMiddleware(AgentMiddleware):
                 latest_human = msg
                 break
 
-        # Extract context from tool messages
         context = _extract_context_from_tool_messages(messages)
 
         # Build state updates for context fields
@@ -214,7 +228,7 @@ class ContextMiddleware(AgentMiddleware):
         return updates if updates else None
 
     def after_model(self, state: THFState, runtime) -> dict[str, Any] | None:
-        """Log the LLM's tool call decisions for terminal visibility."""
+        """Log Thought + Action from LLM response (replicates verbose=True)."""
         messages = state.get("messages", [])
         if not messages:
             return None
@@ -223,16 +237,21 @@ class ContextMiddleware(AgentMiddleware):
         if not isinstance(last_msg, AIMessage):
             return None
 
-        # Log tool calls (equivalent to old verbose=True Action: blocks)
+        # --- Verbose logging: Thought (LLM reasoning text) ---
+        if last_msg.content:
+            logger.info("Thought", text=last_msg.content[:500])
+
+        # --- Verbose logging: Action (tool calls with parameters) ---
         tool_calls = getattr(last_msg, "tool_calls", None)
         if tool_calls:
             for tc in tool_calls:
-                logger.info("Agent tool call",
+                logger.info("Action",
                             tool=tc.get("name"),
-                            args=tc.get("args"))
-        elif last_msg.content:
-            # Final answer — log a preview
-            logger.info("Agent response",
-                        response_preview=last_msg.content[:200])
+                            input=json.dumps(tc.get("args", {}), default=str))
+        elif last_msg.content and not tool_calls:
+            # No tool calls = Final Answer
+            logger.info("Action",
+                        tool="Final Answer",
+                        input=last_msg.content[:300])
 
         return None
